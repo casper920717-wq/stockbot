@@ -70,39 +70,104 @@ def fmt2(x):
         return "--"
 
 def fetch_twse_quote(code: str):
-    """優先取 TWSE 即時價，失敗丟出例外"""
+    """優先取 TWSE 即時價；盤後或取不到 z 時回退昨收 y。"""
     url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{code}.tw"
-    r = requests.get(url, timeout=8)
+    headers = {
+        "Referer": "https://mis.twse.com.tw/stock/index.jsp",
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+    r = requests.get(url, headers=headers, timeout=12)
     js = r.json()
+
+    # 取第一筆
     d = (js.get("msgArray") or [{}])[0]
     name = d.get("n", code)
-    z = d.get("z")
-    y = d.get("y")
-    price = float(z) if z not in (None, "-", "0") else None
-    prev_close = float(y) if y not in (None, "-") else None
+
+    def _f(v):
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    z = d.get("z")      # 最新成交價（盤後常為 "-"）
+    pz = d.get("pz")    # 前一筆成交價（有時可用）
+    y = d.get("y")      # 昨收
+
+    price = _f(z) or _f(pz) or None
+    prev_close = _f(y)
+
+    # 盤後或取不到 z/pz：改用昨收，避免整支股票被跳過
+    if price is None and prev_close is not None:
+        price = prev_close
+
+    if price is None and prev_close is None:
+        raise RuntimeError(f"TWSE 無法取得 {code} 成交價/昨收")
+
     return name, price, prev_close
 
+
 def fetch_yf_last_two(code: str):
-    """yfinance 備援：取最近兩天收盤"""
     t = f"{code}.TW"
     df = yf.download(t, period="5d", interval="1d", progress=False)
-    if df.empty or len(df["Close"]) < 2:
+    if df.empty or "Close" not in df:
         raise RuntimeError("yfinance 無資料")
-    return code, float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
+
+    closes = []
+    for v in df["Close"].tolist():
+        try:
+            closes.append(float(v))
+        except (TypeError, ValueError):
+            pass
+
+    if len(closes) < 2:
+        raise RuntimeError("yfinance 無足夠收盤價")
+
+    return code, closes[-1], closes[-2]
+
 
 def calc_ma10_ma20(code: str):
-    """用日線收盤估算 MA10/MA20 與昨日 MA20"""
     t = f"{code}.TW"
     df = yf.download(t, period="40d", interval="1d", progress=False)
-    if df.empty or len(df["Close"]) < 21:
+    if df.empty or "Close" not in df:
         return None, None, None
-    close = df["Close"]
-    ma10 = mean(close.tail(10))
-    ma20 = mean(close.tail(20))
-    prev_ma20 = mean(close.tail(21).head(20))
+
+    # 轉成 float 並去掉 NaN
+    closes = []
+    for v in df["Close"].tolist():
+        try:
+            closes.append(float(v))
+        except (TypeError, ValueError):
+            pass
+
+    if len(closes) < 21:
+        return None, None, None
+
+    ma10 = sum(closes[-10:]) / 10
+    ma20 = sum(closes[-20:]) / 20
+    prev_ma20 = sum(closes[-21:-1]) / 20  # 昨日的 MA20
     return ma10, ma20, prev_ma20
 
+# ===== 開盤時段防呆（台灣時間）=====
+from datetime import datetime, time
+from zoneinfo import ZoneInfo  # 標準庫，Python 3.9+
 
+_TZ = ZoneInfo("Asia/Taipei")
+
+def is_market_open(now: datetime | None = None) -> bool:
+    now = now or datetime.now(_TZ)
+    # 週一=0 … 週日=6；週末關閉
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    # 台股一般盤：09:00–13:30
+    return time(9, 0) <= t <= time(13, 30)
+
+_now = datetime.now(_TZ)
+if not is_market_open(_now):
+    print(f"⏰ 非開盤時間，程式結束（{_now:%Y-%m-%d %H:%M:%S %Z}）")
+    import sys
+    sys.exit(0)
 # ===== 主流程 =====
 lines, alerts = [], []
 
@@ -132,18 +197,18 @@ for code in CODES:
 # 只做 MA20 的「昨日→今日」穿越判定（兩種方向）
     if (prev_close is not None and prev_ma20 is not None
     and price is not None and ma20 is not None):
-    if prev_close < prev_ma20 and price > ma20:
-        event = "crossup20"     # 昨日低於、今日高於
-    elif prev_close > prev_ma20 and price < ma20:
-        event = "crossdown20"   # 昨日高於、今日低於
+        if prev_close < prev_ma20 and price > ma20:
+            event = "crossup20"     # 昨日低於、今日高於
+        elif prev_close > prev_ma20 and price < ma20:
+            event = "crossdown20"   # 昨日高於、今日低於
 
 
     # --- 警報訊息（不做跨執行去重；有需要再說）---
     if event:
         if event == "crossup20":
-        alerts.append(f"⬆️ {name}（{code}）突破 MA20｜今價 {fmt2(price)}｜MA20 {fmt2(ma20)}")
+            alerts.append(f"⬆️ {name}（{code}）突破 MA20｜今價 {fmt2(price)}｜MA20 {fmt2(ma20)}")
         elif event == "crossdown20":
-        alerts.append(f"⬇️ {name}（{code}）突破 MA20｜今價 {fmt2(price)}｜MA20 {fmt2(ma20)}")
+            alerts.append(f"⬇️ {name}（{code}）突破 MA20｜今價 {fmt2(price)}｜MA20 {fmt2(ma20)}")
         elif event == "touch10":
             alerts.append(f"📍 {name}（{code}）接近 MA10｜今價 {fmt2(price)}｜MA10 {fmt2(ma10)}")
 
