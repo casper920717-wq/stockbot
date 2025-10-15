@@ -9,18 +9,19 @@
 #   UPSTASH_REDIS_REST_URL      （可選；去重用）
 #   UPSTASH_REDIS_REST_TOKEN    （可選；去重用）
 
-import requests
-try:
-    requests.get("https://httpbin.org/ip", timeout=5)
-    print("🌍 外網連通 OK")
-except Exception as e:
-    print("🌍 外網無法連線：", e)
-
-
-
 
 import os, math, time, datetime as dt, requests, pandas as pd, urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==== Force IPv4 for urllib3/requests ====
+import socket
+import urllib3.util.connection as urllib3_cn
+
+def _force_ipv4():
+    return socket.AF_INET  # 僅允許 IPv4
+
+urllib3_cn.allowed_gai_family = _force_ipv4
+# =========================================
 
 # ======== LINE ========
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")
