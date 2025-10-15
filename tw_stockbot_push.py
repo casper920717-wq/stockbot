@@ -129,32 +129,28 @@ for code in CODES:
 
     # --- 事件判定（沿用你現有的觸碰/上穿/下穿）---
     event = None
-    if ma20 is not None and price is not None and abs(price - ma20) / ma20 <= TOUCH_TOL:
-        event = "touch20"
-    elif (prev_close is not None and prev_ma20 is not None
-          and prev_close < prev_ma20 and price > ma20):
-        event = "crossup20"
-    elif (prev_close is not None and prev_ma20 is not None
-          and prev_close > prev_ma20 and price < ma20):
-        event = "crossdown20"
-    elif ma10 is not None and price is not None and abs(price - ma10) / ma10 <= TOUCH_TOL:
-        event = "touch10"
+# 只做 MA20 的「昨日→今日」穿越判定（兩種方向）
+    if (prev_close is not None and prev_ma20 is not None
+    and price is not None and ma20 is not None):
+    if prev_close < prev_ma20 and price > ma20:
+        event = "crossup20"     # 昨日低於、今日高於
+    elif prev_close > prev_ma20 and price < ma20:
+        event = "crossdown20"   # 昨日高於、今日低於
+
 
     # --- 警報訊息（不做跨執行去重；有需要再說）---
     if event:
         if event == "crossup20":
-            alerts.append(f"⬆️ {name}（{code}）突破 MA20｜今價 {fmt2(price)}｜MA20 {fmt2(ma20)}")
+        alerts.append(f"⬆️ {name}（{code}）突破 MA20｜今價 {fmt2(price)}｜MA20 {fmt2(ma20)}")
         elif event == "crossdown20":
-            alerts.append(f"⬇️ {name}（{code}）跌破 MA20｜今價 {fmt2(price)}｜MA20 {fmt2(ma20)}")
-        elif event == "touch20":
-            alerts.append(f"📍 {name}（{code}）接近 MA20｜今價 {fmt2(price)}｜MA20 {fmt2(ma20)}")
+        alerts.append(f"⬇️ {name}（{code}）突破 MA20｜今價 {fmt2(price)}｜MA20 {fmt2(ma20)}")
         elif event == "touch10":
             alerts.append(f"📍 {name}（{code}）接近 MA10｜今價 {fmt2(price)}｜MA10 {fmt2(ma10)}")
 
     # --- 列表輸出（先用直排；之後再做對齊版）---
     lines.append(
-        f"{code} {name}｜今價 {fmt2(price)}｜{chg_txt}｜MA10 {fmt2(ma10)}｜MA20 {fmt2(ma20)}"
-    )
+    f"{code:<5} {name:<8}｜今價 {fmt2(price):>7}｜{chg_txt:<8}｜MA10 {fmt2(ma10):>7}｜MA20 {fmt2(ma20):>7}"
+)
 
 # ===== 推播輸出 =====
 summary = "📊 今日股價監控\n" + "\n".join(lines)
