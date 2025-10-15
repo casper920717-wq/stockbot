@@ -15,22 +15,59 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ======== LINE ========
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")
 
-def line_send(msg: str) -> bool:
-    """送 LINE；成功回傳 True；未設 token 或失敗回傳 False（不重複印整段）"""
-    if not LINE_ACCESS_TOKEN:
-        print("[WARN] 未設定 LINE_ACCESS_TOKEN，訊息未推送")
+def line_send(message: str) -> bool:
+    import os, time, socket, requests
+    from urllib3.util.retry import Retry
+    from requests.adapters import HTTPAdapter
+
+    token = os.getenv("LINE_NOTIFY_TOKEN")
+    if not token:
+        print("⚠️ 找不到 LINE Notify Token（環境變數 LINE_NOTIFY_TOKEN）")
         return False
+
+    url = "https://notify-api.line.me/api/notify"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"message": message}
+
+    # 1) 先做 DNS 檢查，方便在 Render Log 快速定位問題
     try:
-        r = requests.post(
-            "https://notify-api.line.me/api/notify",
-            headers={"Authorization": f"Bearer {LINE_ACCESS_TOKEN}"},
-            data={"message": msg[:4900]},
-            timeout=15,
-        )
-        print("[LINE]", r.status_code, r.text[:120])
-        return r.status_code == 200
+        dns_ip = socket.gethostbyname("notify-api.line.me")
+        print(f"🌐 DNS 解析成功：notify-api.line.me → {dns_ip}")
     except Exception as e:
-        print("[LINE] 送出失敗：", e)
+        print(f"🛑 DNS 解析失敗：{e}")
+        # 等 2 秒再試一次（臨時性 DNS 問題很常一兩秒內恢復）
+        time.sleep(2)
+        try:
+            dns_ip = socket.gethostbyname("notify-api.line.me")
+            print(f"🌐 二次解析成功：notify-api.line.me → {dns_ip}")
+        except Exception as e2:
+            print(f"🛑 二次 DNS 仍失敗：{e2}")
+            return False
+
+    # 2) 設定 requests Session + Retry（含退避），應對暫時性網路抖動
+    session = requests.Session()
+    retry = Retry(
+        total=3,               # 最多 3 次
+        backoff_factor=0.8,    # 0.8, 1.6, 3.2 秒退避
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("POST", "GET"),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    try:
+        resp = session.post(url, headers=headers, data=payload, timeout=10)
+        if resp.status_code == 200:
+            print("✅ LINE Notify 發送成功")
+            return True
+        else:
+            print(f"⚠️ LINE Notify 回應碼：{resp.status_code}，內容：{resp.text[:200]}")
+            return False
+    except requests.exceptions.RequestException as e:
+        print(f"🛑 LINE Notify 發送例外：{e}")
         return False
 
 import os, sys, datetime as dt
