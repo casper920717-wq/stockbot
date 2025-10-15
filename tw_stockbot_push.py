@@ -9,6 +9,16 @@
 #   UPSTASH_REDIS_REST_URL      （可選；去重用）
 #   UPSTASH_REDIS_REST_TOKEN    （可選；去重用）
 
+import requests
+try:
+    requests.get("https://httpbin.org/ip", timeout=5)
+    print("🌍 外網連通 OK")
+except Exception as e:
+    print("🌍 外網無法連線：", e)
+
+
+
+
 import os, math, time, datetime as dt, requests, pandas as pd, urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
