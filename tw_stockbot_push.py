@@ -1,162 +1,203 @@
 # tw_stockbot_push.py
-# 需求 (先裝一次):
-#   python3 -m pip install --upgrade requests yfinance pandas certifi
+# 功能：
+# - 每 5 分鐘輪詢（Render Cron）抓台股即時價
+# - 若 TWSE 無即時價，備援用 yfinance 1m（延遲 ~10–15 分鐘）
+# - 計算 MA10 / MA20；偵測接近/上穿/下穿；用 Upstash Redis 做「當日去重」
+# - line_send() 回傳 True/False，避免在 console 重複輸出
+# 需要的環境變數（Render → Environment）：
+#   LINE_ACCESS_TOKEN
+#   UPSTASH_REDIS_REST_URL      （可選；去重用）
+#   UPSTASH_REDIS_REST_TOKEN    （可選；去重用）
 
-import os, json, time, math
-import requests, certifi, urllib3
-import pandas as pd
-import yfinance as yf
-from datetime import datetime
-
-# 關閉因 verify=False 觸發的警告（僅在 SSL 回退時使用，正常情況不會用到）
+import os, math, time, datetime as dt, requests, pandas as pd, urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ============ ① 監測清單（台股） ============
-# 可用 "2330" 或 "2330.TW" / 櫃買 "5483" 或 "5483.TWO"
-TICKERS = ["2330.TW", "3361.TW", "6415.TW"]
-#2330台積電 ＃3661世芯 ＃6415矽力
+# ======== LINE ========
+LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")
 
-# ============ ② LINE Messaging API ============
-ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")   # 你先前已設定好的環境變數
-PUSH_MODE = "broadcast"                         # "broadcast" 或 "push"
-LINE_USER_ID = os.getenv("LINE_USER_ID")        # 若用 push 模式需要
+def line_send(msg: str) -> bool:
+    """送 LINE；成功回傳 True；未設 token 或失敗回傳 False（不重複印整段）"""
+    if not LINE_ACCESS_TOKEN:
+        print("[WARN] 未設定 LINE_ACCESS_TOKEN，訊息未推送")
+        return False
+    try:
+        r = requests.post(
+            "https://notify-api.line.me/api/notify",
+            headers={"Authorization": f"Bearer {LINE_ACCESS_TOKEN}"},
+            data={"message": msg[:4900]},
+            timeout=15,
+        )
+        print("[LINE]", r.status_code, r.text[:120])
+        return r.status_code == 200
+    except Exception as e:
+        print("[LINE] 送出失敗：", e)
+        return False
 
-def line_send(text: str):
-    if not ACCESS_TOKEN:
-        print("[WARN] 未設定 LINE_ACCESS_TOKEN，以下訊息僅印出：\n", text)
-        return
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {ACCESS_TOKEN}"}
-    payload = {"messages": [{"type": "text", "text": text[:4900]}]}  # 文字上限保守 4900
-    if PUSH_MODE == "broadcast":
-        url = "https://api.line.me/v2/bot/message/broadcast"
-        res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
-    else:
-        if not LINE_USER_ID:
-            print("[WARN] PUSH 模式但未設定 LINE_USER_ID，訊息僅印出：\n", text); return
-        url = "https://api.line.me/v2/bot/message/push"
-        body = {"to": LINE_USER_ID, **payload}
-        res = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
-    if res.status_code != 200:
-        print("[LINE 推播失敗]", res.status_code, res.text)
+# ======== Upstash Redis（去重，可選） ========
+REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-# ============ ③ 參數 ============
-PERIOD   = "6mo"   # 用來計算 MA 的歷史區間
+def dedup_check_and_set(key: str, ttl_sec: int = 86400) -> bool:
+    """第一次看到 key -> 設定並回傳 True；已存在 -> 回傳 False"""
+    if not REDIS_URL or not REDIS_TOKEN:
+        return True  # 未設定 Redis 時，不去重
+    try:
+        r = requests.post(f"{REDIS_URL}/get/{key}",
+                          headers={"Authorization": f"Bearer {REDIS_TOKEN}"}, timeout=8)
+        if r.ok and (r.json().get("result") is not None):
+            return False
+        # 設定與過期
+        requests.post(f"{REDIS_URL}/set/{key}/{int(time.time())}",
+                      headers={"Authorization": f"Bearer {REDIS_TOKEN}"}, timeout=8)
+        requests.post(f"{REDIS_URL}/expire/{key}/{ttl_sec}",
+                      headers={"Authorization": f"Bearer {REDIS_TOKEN}"}, timeout=8)
+        return True
+    except Exception as e:
+        print("[DEDUP] 失敗，忽略去重：", e)
+        return True
+
+# ======== 參數設定 ========
+CODES = ["2330", "3017","3661", "3324","2421", "6230","6415"]  # 要監控的台股代碼#奇鋐（3017）#雙鴻（3324）#建準（2421）#超眾（6230）TOUCH_TOL = 0.005
+TOUCH_TOL = 0.005                  # ±0.5% 視為接近
+PERIOD = "6mo"                     # yfinance 計 MA 用
 INTERVAL = "1d"
-# 觸發設定
-ENABLE_ALERT = True        # 是否啟用 MA20 警報
-TOUCH_TOL = 0.005          # 「接近 MA20」容忍度 0.5%（可調）
-ALERT_HEADER = "📣 STOCKBOT 警報"
 
-# ============ ④ 工具 ============
-def tw_code_of(tk: str) -> str:
-    return "".join(ch for ch in tk if ch.isdigit())
-
+# ======== 工具 ========
 def to_float(x):
     try:
         if x is None: return None
         if isinstance(x, str) and x.strip() in {"", "-", "NaN"}: return None
-        if isinstance(x, pd.Series):
-            x = x.iloc[0]
+        if isinstance(x, pd.Series): x = x.iloc[0]
         v = float(x)
-        if math.isfinite(v): return v
+        return v if math.isfinite(v) else None
     except Exception:
-        pass
+        return None
+
+def fmt2(x):
+    return f"{x:.2f}" if isinstance(x, (int, float)) and x is not None else "—"
+
+# ======== TWSE 即時價 ========
+def fetch_twse_quotes(codes):
+    """TWSE 即時價（可能偶爾回 '-' 表示暫無成交）"""
+    chs = [f"tse_{c}.tw" for c in codes]  # 上市 tse。若需要上櫃可擴充 otc
+    url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=" + "|".join(chs)
+    r = requests.get(url,
+                     headers={"Referer": "https://mis.twse.com.tw/stock/index.jsp",
+                              "User-Agent": "Mozilla/5.0"},
+                     timeout=15, verify=False)
+    r.raise_for_status()
+    data = r.json().get("msgArray", [])
+    return {d.get("c"): d for d in data if "c" in d}
+
+# ======== yfinance：MA 與備援價 ========
+def fetch_ma(code):
+    """用 yfinance 計算 MA10/MA20，並提供昨收/前一日 MA20（穿越判定用）"""
+    import yfinance as yf
+    df = yf.download(f"{code}.TW", period=PERIOD, interval=INTERVAL,
+                     auto_adjust=True, progress=False)
+    if df is None or df.empty or "Close" not in df:
+        return None, None, None, (None, None)
+    close = df["Close"]
+    df["MA10"] = close.rolling(10).mean()
+    df["MA20"] = close.rolling(20).mean()
+    y_close = to_float(close.iloc[-1])
+    ma10 = to_float(df["MA10"].iloc[-1])
+    ma20 = to_float(df["MA20"].iloc[-1])
+    prev_close = to_float(close.iloc[-2]) if len(close) >= 2 else None
+    prev_ma20  = to_float(df["MA20"].iloc[-2]) if len(close) >= 2 else None
+    return y_close, ma10, ma20, (prev_close, prev_ma20)
+
+def fallback_price_from_yf_1m(code):
+    """TWSE 無價時，用 yfinance 1 分線作為延遲備援（約 10–15 分鐘延遲）"""
+    try:
+        import yfinance as yf
+        df = yf.download(f"{code}.TW", period="1d", interval="1m", progress=False)
+        if df is not None and not df.empty and "Close" in df:
+            return to_float(df["Close"].iloc[-1])
+    except Exception as e:
+        print(f"[FALLBACK] yfinance 1m 取得失敗 {code}: {e}")
     return None
 
-# ============ ⑤ TWSE 即時報價（含 SSL 自動回退） ============
-def fetch_twse_quotes(codes):
-    def call_api(ex, codes_):
-        if not codes_: return {}
-        ch = "|".join([f"{ex}_{c}.tw" for c in codes_])
-        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ch}&_={int(time.time()*1000)}"
-        headers = {"Referer": "https://mis.twse.com.tw/stock/index.jsp", "User-Agent": "Mozilla/5.0"}
-        try:
-            r = requests.get(url, headers=headers, timeout=10, verify=certifi.where())
-            r.raise_for_status()
-        except requests.exceptions.SSLError as e:
-            print("[WARN] SSL 憑證驗證失敗，改以不驗證方式重試一次：", e)
-            r = requests.get(url, headers=headers, timeout=10, verify=False)
-            r.raise_for_status()
-        data = r.json()
-        return {it.get("c"): it for it in data.get("msgArray", [])}
-    tse_res = call_api("tse", codes)
-    missing = [c for c in codes if c not in tse_res]
-    otc_res = call_api("otc", missing) if missing else {}
-    return {**tse_res, **otc_res}
-
-# ============ ⑥ 主流程 ============
+# ======== 主程式 ========
 def main():
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    tw_codes = [tw_code_of(tk) for tk in TICKERS]
-    tw_quotes = fetch_twse_quotes(tw_codes) if tw_codes else {}
+    now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    quotes = fetch_twse_quotes(CODES)
 
-    lines = [f"📊 STOCKBOT 摘要（{date_str}）"]
+    lines = [f"📊 台股均線監控（{now_str}）"]
     alerts = []
 
-    for tk in TICKERS:
-        code = tw_code_of(tk)
-        yahoo_symbol = tk if (tk.endswith(".TW") or tk.endswith(".TWO")) else f"{code}.TW"
+    for code in CODES:
+        q = quotes.get(code, {})
+        name = q.get("n") or code
 
-        # 歷史（日線）供昨收與 MA 計算
-        df = yf.download(yahoo_symbol, period=PERIOD, interval=INTERVAL, auto_adjust=True, progress=False)
-        if df is None or df.empty or "Close" not in df:
-            lines.append(f"{code} 取得資料失敗")
+        # 1) 先用 TWSE
+        price = to_float(q.get("z"))
+        yclose = to_float(q.get("y"))
+        source_tag = "TWSE 即時"
+
+        # 2) 若 TWSE 無價，改用 yfinance 1分線（延遲）
+        if price is None:
+            yf_price = fallback_price_from_yf_1m(code)
+            if yf_price is not None:
+                price = yf_price
+                source_tag = "Yahoo延遲"
+            else:
+                lines.append(f"⚠️ {name}（{code}）暫無成交價")
+                continue
+
+        # 漲跌幅 + 顏色
+        chg_pct = ((price - yclose) / yclose) * 100 if (yclose is not None and price is not None) else None
+        color = "🔴" if (chg_pct is not None and chg_pct > 0) else ("🟢" if (chg_pct is not None and chg_pct < 0) else "➖")
+        chg_txt = f"{color} {chg_pct:+.2f}%" if chg_pct is not None else "—"
+
+        # MA
+        y_close, ma10, ma20, prev_pair = fetch_ma(code)
+        if ma10 is None or ma20 is None:
+            lines.append(f"{code} {name}｜今價 {fmt2(price)}（{source_tag}）｜漲跌 {chg_txt}｜MA10/MA20 無法取得")
             continue
+        prev_close, prev_ma20 = prev_pair
 
-        close = df["Close"]
-        df["MA10"] = close.rolling(10).mean()
-        df["MA20"] = close.rolling(20).mean()
+        # ===== 事件判定 =====
+        event = None
+        if ma20 is not None and price is not None and abs(price - ma20) / ma20 <= TOUCH_TOL:
+            event = "touch20"
+        elif (prev_close is not None and prev_ma20 is not None and
+              prev_close < prev_ma20 and price > ma20):
+            event = "crossup20"
+        elif (prev_close is not None and prev_ma20 is not None and
+              prev_close > prev_ma20 and price < ma20):
+            event = "crossdown20"
+        elif ma10 is not None and price is not None and abs(price - ma10) / ma10 <= TOUCH_TOL:
+            event = "touch10"
 
-        y_close = to_float(close.iloc[-1])
-        ma10    = to_float(df["MA10"].iloc[-1])
-        ma20    = to_float(df["MA20"].iloc[-1])
-        # 取前一筆供穿越判斷
-        prev_close = to_float(close.iloc[-2]) if len(close) >= 2 else None
-        prev_ma20  = to_float(df["MA20"].iloc[-2]) if len(close) >= 2 else None
+        # ===== 去重（每日一次）=====
+        if event:
+            key = f"maalert:{dt.datetime.now():%Y-%m-%d}:{code}:{event}"
+            if dedup_check_and_set(key, ttl_sec=60*60*24*2):
+                if event == "touch20":
+                    alerts.append(f"⚠️ {name}（{code}）接近 MA20｜今價 {fmt2(price)}（{source_tag}）｜MA20 {fmt2(ma20)}")
+                elif event == "crossup20":
+                    alerts.append(f"🔼 {name}（{code}）上穿 MA20｜今價 {fmt2(price)}（{source_tag}）｜MA20 {fmt2(ma20)}")
+                elif event == "crossdown20":
+                    alerts.append(f"🔽 {name}（{code}）下穿 MA20｜今價 {fmt2(price)}（{source_tag}）｜MA20 {fmt2(ma20)}")
+                elif event == "touch10":
+                    alerts.append(f"⚠️ {name}（{code}）接近 MA10｜今價 {fmt2(price)}（{source_tag}）｜MA10 {fmt2(ma10)}")
+            else:
+                print(f"[SKIP] 去重 {key}")
 
-        q = tw_quotes.get(code, {})
-        rt_price = to_float(q.get("z"))
-        rt_time  = q.get("t") or "-"
-        name     = q.get("n") or "—"
-        market   = q.get("ex") or "tse/otc"
+        lines.append(f"{code} {name}｜今價 {fmt2(price)}（{source_tag}）｜漲跌 {chg_txt}｜MA10 {fmt2(ma10)}｜MA20 {fmt2(ma20)}")
 
-        today_price = rt_price if rt_price is not None else y_close
-        source_tag  = "TWSE 即時" if rt_price is not None else "昨收(回退)"
+    # ===== 輸出 / 推播（避免重複）=====
+    summary = "\n".join(lines)
+    sent_summary = line_send(summary)
+    if not sent_summary:
+        print(summary)
 
-        def fmt(x): return f"{x:.2f}" if isinstance(x, (int,float)) and x is not None else "—"
-
-        # 摘要列
-        lines.append(
-            f"{code} {name}｜昨收 {fmt(y_close)}｜今價 {fmt(today_price)}（{source_tag} {rt_time}）｜MA10 {fmt(ma10)}｜MA20 {fmt(ma20)}"
-        )
-
-        # ===== 警報（可依需求調整/關閉）=====
-        if ENABLE_ALERT and today_price is not None and ma20 is not None:
-            touched = abs(today_price - ma20) / ma20 <= TOUCH_TOL
-            crossed_up = (prev_close is not None and prev_ma20 is not None and
-                          prev_close < prev_ma20 and today_price > ma20)
-            crossed_down = (prev_close is not None and prev_ma20 is not None and
-                            prev_close > prev_ma20 and today_price < ma20)
-
-            if crossed_up:
-                alerts.append(f"🔼 {code} {name}\n今價 {fmt(today_price)} 上穿 MA20 {fmt(ma20)}")
-            elif crossed_down:
-                alerts.append(f"🔽 {code} {name}\n今價 {fmt(today_price)} 下穿 MA20 {fmt(ma20)}")
-            elif touched:
-                alerts.append(f"⏸ {code} {name}\n今價 {fmt(today_price)} 接近 MA20 {fmt(ma20)}（±{int(TOUCH_TOL*1000)/10}%）")
-
-    # 推播摘要
-    summary_msg = "\n".join(lines)
-    line_send(summary_msg)
-    print(summary_msg)
-
-    # 推播警報（若有）
     if alerts:
-        alert_msg = f"{ALERT_HEADER}\n" + "\n\n".join(alerts)
-        line_send(alert_msg)
-        print(alert_msg)
-    else:
-        print("（無警報觸發）")
+        alert_msg = "📣 均線警報\n" + "\n".join(alerts)
+        sent_alerts = line_send(alert_msg)
+        if not sent_alerts:
+            print(alert_msg)
 
 if __name__ == "__main__":
     main()
