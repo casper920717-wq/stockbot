@@ -77,33 +77,47 @@ if os.getenv("TEST_LINE") == "1":
         print(_msg)
     sys.exit(0)
 # =========================================
+def line_send(message: str) -> bool:
+    import os, json, requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
 
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('LINE_CHANNEL_TOKEN')}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "to": os.getenv("LINE_USER_ID") or os.getenv("LINE_GROUP_ID"),
+        "messages": [{"type": "text", "text": message}]
+    }
 
-    # 2) 設定 requests Session + Retry（含退避），應對暫時性網路抖動
+    # 2) 設定 Session + Retry（連線重試）
     session = requests.Session()
     retry = Retry(
-        total=3,               # 最多 3 次
-        backoff_factor=0.8,    # 0.8, 1.6, 3.2 秒退避
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("POST", "GET"),
+        total=3,
+        backoff_factor=0.8,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["POST", "GET"],
         raise_on_status=False,
-        respect_retry_after_header=True,
+        respect_retry_after_header=True
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
 
     try:
-        resp = session.post(url, headers=headers, data=payload, timeout=10)
+        resp = session.post(url, headers=headers, data=json.dumps(data), timeout=10)
         if resp.status_code == 200:
-            print("✅ LINE Notify 發送成功")
+            print("✅ LINE 推送成功")
             return True
         else:
-            print(f"⚠️ LINE Notify 回應碼：{resp.status_code}，內容：{resp.text[:200]}")
+            print(f"⚠️ LINE 回應 {resp.status_code}：{resp.text[:200]}")
             return False
     except requests.exceptions.RequestException as e:
-        print(f"🛑 LINE Notify 發送例外：{e}")
+        print(f"🛑 LINE 發送例外：{e}")
         return False
+
 
 import os, sys, datetime as dt
 
