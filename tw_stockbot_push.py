@@ -33,6 +33,16 @@ def line_send(msg: str) -> bool:
         print("[LINE] 送出失敗：", e)
         return False
 
+import os, sys, datetime as dt
+
+# —— 測試模式：只發一則測試訊息就結束 —— 
+if os.getenv("TEST_LINE") == "1":
+    _msg = f"🔔 LINE 測試訊息（Render）{dt.datetime.now():%Y-%m-%d %H:%M:%S}"
+    ok = line_send(_msg)
+    if not ok:
+        print(_msg)
+    sys.exit(0)
+
 # ======== Upstash Redis（去重，可選） ========
 REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
@@ -185,7 +195,12 @@ def main():
             else:
                 print(f"[SKIP] 去重 {key}")
 
-        lines.append(f"{code} {name}｜今價 {fmt2(price)}（{source_tag}）｜漲跌 {chg_txt}｜MA10 {fmt2(ma10)}｜MA20 {fmt2(ma20)}")
+        if (ma20 is not None) and (price is not None):
+            _ma20_status = "🔺高於 MA20" if price > ma20 else ("🔻低於 MA20" if price < ma20 else "等於 MA20")
+            lines.append(f"{code} {name}｜今價 {fmt2(price)}｜{chg_txt}｜MA10 {fmt2(ma10)}｜MA20 {fmt2(ma20)}｜當前價位：{_ma20_status}")
+        else:
+            lines.append(f"{code} {name}｜今價 {fmt2(price)}｜{chg_txt}｜MA10 {fmt2(ma10)}｜MA20 {fmt2(ma20)}")
+
 
     # ===== 輸出 / 推播（避免重複）=====
     summary = "\n".join(lines)
@@ -198,6 +213,8 @@ def main():
         sent_alerts = line_send(alert_msg)
         if not sent_alerts:
             print(alert_msg)
+
+   
 
 if __name__ == "__main__":
     main()
