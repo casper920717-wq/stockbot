@@ -13,7 +13,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ============ ① 監測清單（台股） ============
 # 可用 "2330" 或 "2330.TW" / 櫃買 "5483" 或 "5483.TWO"
-TICKERS = ["2330.TW", "2303.TW", "2412.TW"]
+TICKERS = ["2330.TW", "3361.TW", "6415.TW"]
+#2330台積電 ＃3661世芯 ＃6415矽力
 
 # ============ ② LINE Messaging API ============
 ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")   # 你先前已設定好的環境變數
