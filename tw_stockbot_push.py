@@ -27,33 +27,57 @@ urllib3_cn.allowed_gai_family = _force_ipv4
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")
 
 def line_send(message: str) -> bool:
-    import os, time, socket, requests
-    from urllib3.util.retry import Retry
-    from requests.adapters import HTTPAdapter
+    """
+    使用 LINE Messaging API 推送訊息。
+    需要環境變數：
+      - LINE_CHANNEL_TOKEN  (Messaging API 的 Channel access token)
+      - LINE_USER_ID 或 LINE_GROUP_ID (擇一)
+    """
+    import os, json, requests
 
-    token = os.getenv("LINE_NOTIFY_TOKEN")
-    if not token:
-        print("⚠️ 找不到 LINE Notify Token（環境變數 LINE_NOTIFY_TOKEN）")
+    channel_token = os.getenv("LINE_CHANNEL_TOKEN")
+    target_id = os.getenv("LINE_USER_ID") or os.getenv("LINE_GROUP_ID")
+
+    if not channel_token:
+        print("⚠️ 缺少 LINE_CHANNEL_TOKEN")
+        return False
+    if not target_id:
+        print("⚠️ 請設定 LINE_USER_ID 或 LINE_GROUP_ID")
         return False
 
-    url = "https://notify-api.line.me/api/notify"
-    headers = {"Authorization": f"Bearer {token}"}
-    payload = {"message": message}
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Authorization": f"Bearer {channel_token}",
+        "Content-Type": "application/json"
+    }
 
-    # 1) 先做 DNS 檢查，方便在 Render Log 快速定位問題
+    payload = {
+        "to": target_id,
+        "messages": [{"type": "text", "text": message}]
+    }
+
     try:
-        dns_ip = socket.gethostbyname("notify-api.line.me")
-        print(f"🌐 DNS 解析成功：notify-api.line.me → {dns_ip}")
-    except Exception as e:
-        print(f"🛑 DNS 解析失敗：{e}")
-        # 等 2 秒再試一次（臨時性 DNS 問題很常一兩秒內恢復）
-        time.sleep(2)
-        try:
-            dns_ip = socket.gethostbyname("notify-api.line.me")
-            print(f"🌐 二次解析成功：notify-api.line.me → {dns_ip}")
-        except Exception as e2:
-            print(f"🛑 二次 DNS 仍失敗：{e2}")
+        resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+        if resp.status_code == 200:
+            print("✅ LINE Messaging API 推送成功")
+            return True
+        else:
+            print(f"⚠️ Messaging API 回應 {resp.status_code}：{resp.text[:200]}")
             return False
+    except requests.exceptions.RequestException as e:
+        print(f"🛑 推送例外：{e}")
+        return False
+
+    # ======== ✅ 測試模式（Render 用） ========
+import os, sys, datetime as dt
+if os.getenv("TEST_LINE") == "1":
+    _msg = f"🔔 LINE 測試訊息（Render）{dt.datetime.now():%Y-%m-%d %H:%M:%S}"
+    ok = line_send(_msg)
+    if not ok:
+        print(_msg)
+    sys.exit(0)
+# =========================================
+
 
     # 2) 設定 requests Session + Retry（含退避），應對暫時性網路抖動
     session = requests.Session()
