@@ -1,230 +1,276 @@
-# =========================================
-# 📈 TW Stockbot Push.py (Clean / No-Redis)
-# 只保留：Messaging API 推播、TEST_LINE 測試、抓價 + MA10/MA20 + 事件判定
-# 相依：requests, yfinance, statistics（標準庫）, datetime（標準庫）
-# =========================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+tw_stockbot_push.py (yfinance-only, Messaging API)
+--------------------------------------------------
+- 台股抓價只用 yfinance，穩定處理 .TW/.TWO、自動重試、海外/本機皆可
+- 取得「最新價（1m 最後一筆）」與「昨收（日線倒數第二筆）」
+- 預設推播簡訊息（代號 + 最新/昨收/漲跌幅），也可自行修改為你的訊號邏輯
+- 使用 LINE Messaging API (非 LINE Notify)
+  需要環境變數：
+    LINE_CHANNEL_ACCESS_TOKEN  → Channel access token (long-lived)
+    LINE_TO                    → userId / groupId / roomId
+- 台灣盤中時段：09:00–13:30（可設 ALLOW_OUTSIDE_WINDOW=True 跳過限制）
+"""
 
-import os, json, requests, datetime as dt
+import os
+import sys
+import json
+import time
+import math
+from datetime import datetime, time as dtime
+
+import pytz
+import requests
 import yfinance as yf
-from statistics import mean
+import pandas as pd
 
-# ===== LINE Messaging API =====
-def line_send(message: str) -> bool:
-    """
-    使用 LINE Messaging API 推送文字訊息。
-    需要環境變數：
-      - LINE_CHANNEL_TOKEN
-      - LINE_USER_ID 或 LINE_GROUP_ID (擇一)
-    """
-    channel_token = (os.getenv("LINE_CHANNEL_TOKEN") or "").strip()
-    target_id = (os.getenv("LINE_USER_ID") or os.getenv("LINE_GROUP_ID") or "").strip()
+# ============ 使用者設定 ============
 
-    if not channel_token:
-        print("⚠️ 缺少 LINE_CHANNEL_TOKEN")
+# 代碼清單：預設從環境變數 TW_CODES（逗號分隔，如 "2330,2603,8446"），
+# 若未設則用下方 DEFAULT_CODES。
+DEFAULT_CODES = ["2330", "2603", "8446", "0050"]
+TW_CODES = [c.strip() for c in os.getenv("TW_CODES", "").split(",") if c.strip()] or DEFAULT_CODES
+
+# 每批處理數量（避免一次抓太多被節流）
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
+
+# 盤中時段（台灣時間）
+TZ_TAIPEI = pytz.timezone("Asia/Taipei")
+MARKET_START = dtime(9, 0, 0)    # 09:00
+MARKET_END   = dtime(13, 30, 0)  # 13:30
+ALLOW_OUTSIDE_WINDOW = os.getenv("ALLOW_OUTSIDE_WINDOW", "False").lower() == "true"
+
+# LINE Messaging API
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+LINE_TO = os.getenv("LINE_TO", "").strip()
+LINE_PUSH_API = "https://api.line.me/v2/bot/message/push"
+
+# 快取已解析出的 .TW/.TWO，避免每次都查兩次
+TW_SYMBOL_CACHE_FILE = os.getenv("TW_SYMBOL_CACHE", "tw_symbol_cache.json")
+
+
+# ============ 工具函式 ============
+
+def now_taipei():
+    return datetime.now(TZ_TAIPEI)
+
+
+def within_tw_session(now=None):
+    if now is None:
+        now = now_taipei()
+    t = now.time()
+    return MARKET_START <= t <= MARKET_END
+
+
+def send_line_text(message: str) -> bool:
+    """用 LINE Messaging API 推播文字。"""
+    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_TO:
+        print("[WARN] LINE Messaging API 環境變數未設定（LINE_CHANNEL_ACCESS_TOKEN / LINE_TO）。")
         return False
-    if not target_id:
-        print("⚠️ 請設定 LINE_USER_ID 或 LINE_GROUP_ID")
-        return False
-
-    url = "https://api.line.me/v2/bot/message/push"
     headers = {
-        "Authorization": f"Bearer {channel_token}",
+        "Authorization": "Bearer " + LINE_CHANNEL_ACCESS_TOKEN,
         "Content-Type": "application/json",
     }
-    payload = {
-        "to": target_id,
-        "messages": [{"type": "text", "text": str(message)}],
-    }
-
+    payload = {"to": LINE_TO, "messages": [{"type": "text", "text": message}]}
     try:
-        resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+        resp = requests.post(LINE_PUSH_API, headers=headers, json=payload, timeout=15)
         if resp.status_code == 200:
-            print("✅ LINE 推播成功")
+            print("[INFO] LINE 推播成功。")
             return True
+        print(f"[ERROR] LINE 推播失敗 {resp.status_code}: {resp.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"[ERROR] LINE 推播錯誤: {e}")
+        return False
+
+
+def _load_cache():
+    try:
+        with open(TW_SYMBOL_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_cache(cache: dict):
+    try:
+        tmp = TW_SYMBOL_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp, TW_SYMBOL_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def resolve_tw_symbol(code: str) -> str | None:
+    """
+    自動決定該代碼要用 .TW (上市) 還是 .TWO (上櫃)。
+    請傳「純數字代碼」，不要自行加尾碼。
+    """
+    if "." in code:
+        code = code.split(".")[0]
+
+    cache = _load_cache()
+    if code in cache:
+        return cache[code]
+
+    for suf in (".TW", ".TWO"):
+        sym = f"{code}{suf}"
+        try:
+            df = yf.Ticker(sym).history(period="10d", interval="1d", prepost=False, actions=False)
+            if not df.empty and df["Close"].dropna().shape[0] >= 1:
+                cache[code] = sym
+                _save_cache(cache)
+                return sym
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return None
+
+
+def _retry_history(tkr: yf.Ticker, period: str, interval: str, tries=3, delay=0.6) -> pd.DataFrame:
+    last_err = None
+    for _ in range(tries):
+        try:
+            df = tkr.history(period=period, interval=interval, prepost=False, actions=False)
+            if not df.empty:
+                return df
+        except Exception as e:
+            last_err = e
+        time.sleep(delay)
+    if last_err:
+        print(f"[WARN] history({period},{interval}) failed: {last_err}")
+    return pd.DataFrame()
+
+
+def get_latest_and_prevclose(code: str):
+    """
+    以 yfinance 取得：
+      latest → 1 分鐘線最後一筆
+      prev_close → 日線倒數第二筆（只有一筆時取那筆）
+    回傳: (latest, prev_close, resolved_symbol)
+    """
+    sym = resolve_tw_symbol(code)
+    if not sym:
+        return None, None, None
+
+    tkr = yf.Ticker(sym)
+
+    # 最新價（含今日）
+    h1m = _retry_history(tkr, period="7d", interval="1m")
+    latest = float(h1m["Close"].dropna().iloc[-1]) if not h1m.empty else None
+
+    # 昨收（或只有一筆時當昨收）
+    h1d = _retry_history(tkr, period="10d", interval="1d")
+    prev = None
+    if not h1d.empty:
+        c = h1d["Close"].dropna()
+        if len(c) >= 2:
+            prev = float(c.iloc[-2])
+        elif len(c) == 1:
+            prev = float(c.iloc[-1])
+
+    return latest, prev, sym
+
+
+def fmt(x, nd=2):
+    try:
+        return f"{float(x):,.{nd}f}"
+    except Exception:
+        return "-"
+
+
+def pct(a, b):
+    try:
+        if a is None or b is None or math.isnan(float(a)) or math.isnan(float(b)) or b == 0:
+            return float("nan")
+        return 100.0 * (float(a) - float(b)) / float(b)
+    except Exception:
+        return float("nan")
+
+
+# ============ 主流程 ============
+
+def build_rows(codes):
+    rows = []
+    for code in codes:
+        latest, prev, sym = get_latest_and_prevclose(code)
+        chg = latest - prev if (latest is not None and prev is not None) else None
+        chg_pct = pct(latest, prev) if (latest is not None and prev is not None) else float("nan")
+        rows.append({
+            "code": code,
+            "symbol": sym,
+            "latest": latest,
+            "prev_close": prev,
+            "change": chg,
+            "change_pct": chg_pct,
+        })
+        time.sleep(0.2)  # 降低節流
+    return rows
+
+
+def format_messages(rows, run_dt=None):
+    if run_dt is None:
+        run_dt = now_taipei()
+    ts = run_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    header = f"【台股快訊】{ts}"
+    lines = [header]
+    for r in rows:
+        code = r["code"]
+        latest = r["latest"]
+        prev = r["prev_close"]
+        chg = r["change"]
+        cp = r["change_pct"]
+        latest_s = fmt(latest)
+        prev_s = fmt(prev)
+        if chg is None or pd.isna(chg):
+            lines.append(f"{code}: {latest_s}（昨收 {prev_s}）")
         else:
-            print(f"⚠️ Messaging API 回應 {resp.status_code}：{resp.text[:200]}")
-            return False
-    except requests.exceptions.RequestException as e:
-        print(f"🛑 推播例外：{e}")
-        return False
+            sign = "+" if chg >= 0 else ""
+            cp_s = f"{cp:.2f}%" if not pd.isna(cp) else "-"
+            lines.append(f"{code}: {latest_s} / 昨收 {prev_s}  ({sign}{fmt(chg)}, {cp_s})")
+
+    msg = "\n".join(lines)
+    if len(msg) <= 900:
+        return [msg]
+
+    out = []
+    buf = header
+    for line in lines[1:]:
+        if len(buf) + 1 + len(line) > 900:
+            out.append(buf)
+            buf = header + "\n" + line
+        else:
+            buf += "\n" + line
+    if buf:
+        out.append(buf)
+    return out
 
 
-# ===== 測試模式 (Render: TEST_LINE=1) =====
-if os.getenv("TEST_LINE") == "1":
-    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    msg = f"🔔 LINE 測試訊息（Render）{now}"
-    ok = line_send(msg)
-    if not ok:
-        print(msg)
-    raise SystemExit(0)
+def main():
+    now = now_taipei()
+    if not within_tw_session(now) and not ALLOW_OUTSIDE_WINDOW:
+        print(f"[INFO] 現在 {now.strftime('%Y-%m-%d %H:%M:%S %Z')} 非台股盤中（09:00–13:30），結束。")
+        return
+
+    codes = list(TW_CODES)
+    messages = []
+    for i in range(0, len(codes), BATCH_SIZE):
+        batch = codes[i:i+BATCH_SIZE]
+        rows = build_rows(batch)
+        messages.extend(format_messages(rows, run_dt=now))
+
+    for m in messages:
+        print(m)
+        send_line_text(m)
+        time.sleep(1.0)
 
 
-# ===== 參數設定 =====
-CODES = ["2330", "2344", "2408", "2421", "3017", "3206", "3231", "3324", "3515", "3661", "6230", "6415"]
-TOUCH_TOL = 0.005  # 觸碰容差 ±0.5%
-
-def fmt2(x):
+if __name__ == "__main__":
     try:
-        return f"{float(x):.2f}"
-    except Exception:
-        return "--"
-
-def fetch_twse_quote(code: str):
-    """優先取 TWSE 即時價；盤後或取不到 z 時回退昨收 y。"""
-    url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{code}.tw"
-    headers = {
-        "Referer": "https://mis.twse.com.tw/stock/index.jsp",
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-    }
-    r = requests.get(url, headers=headers, timeout=12)
-    js = r.json()
-
-    # 取第一筆
-    d = (js.get("msgArray") or [{}])[0]
-    name = d.get("n", code)
-
-    def _f(v):
-        try:
-            return float(v)
-        except Exception:
-            return None
-
-    z = d.get("z")      # 最新成交價（盤後常為 "-"）
-    pz = d.get("pz")    # 前一筆成交價（有時可用）
-    y = d.get("y")      # 昨收
-
-    price = _f(z) or _f(pz) or None
-    prev_close = _f(y)
-
-    # 盤後或取不到 z/pz：改用昨收，避免整支股票被跳過
-    if price is None and prev_close is not None:
-        price = prev_close
-
-    if price is None and prev_close is None:
-        raise RuntimeError(f"TWSE 無法取得 {code} 成交價/昨收")
-
-    return name, price, prev_close
-
-
-def fetch_yf_last_two(code: str):
-    t = f"{code}.TW"
-    df = yf.download(t, period="5d", interval="1d", progress=False)
-    if df.empty or "Close" not in df:
-        raise RuntimeError("yfinance 無資料")
-
-    closes = []
-    for v in df["Close"].tolist():
-        try:
-            closes.append(float(v))
-        except (TypeError, ValueError):
-            pass
-
-    if len(closes) < 2:
-        raise RuntimeError("yfinance 無足夠收盤價")
-
-    return code, closes[-1], closes[-2]
-
-
-def calc_ma10_ma20(code: str):
-    t = f"{code}.TW"
-    df = yf.download(t, period="40d", interval="1d", progress=False)
-    if df.empty or "Close" not in df:
-        return None, None, None
-
-    # 轉成 float 並去掉 NaN
-    closes = []
-    for v in df["Close"].tolist():
-        try:
-            closes.append(float(v))
-        except (TypeError, ValueError):
-            pass
-
-    if len(closes) < 21:
-        return None, None, None
-
-    ma10 = sum(closes[-10:]) / 10
-    ma20 = sum(closes[-20:]) / 20
-    prev_ma20 = sum(closes[-21:-1]) / 20  # 昨日的 MA20
-    return ma10, ma20, prev_ma20
-
-# ===== 開盤時段防呆（台灣時間）=====
-from datetime import datetime, time
-from zoneinfo import ZoneInfo  # 標準庫，Python 3.9+
-
-_TZ = ZoneInfo("Asia/Taipei")
-
-def is_market_open(now: datetime | None = None) -> bool:
-    now = now or datetime.now(_TZ)
-    # 週一=0 … 週日=6；週末關閉
-    if now.weekday() >= 5:
-        return False
-    t = now.time()
-    # 台股一般盤：09:00–13:30
-    return time(9, 0) <= t <= time(13, 30)
-
-_now = datetime.now(_TZ)
-if not is_market_open(_now):
-    print(f"⏰ 非開盤時間，程式結束（{_now:%Y-%m-%d %H:%M:%S %Z}）")
-    import sys
-    sys.exit(0)
-# ===== 主流程 =====
-lines, alerts = [], []
-
-for code in CODES:
-    # --- 價格來源：TWSE -> yfinance 備援 ---
-    try:
-        name, price, prev_close = fetch_twse_quote(code)
-    except Exception:
-        try:
-            name, price, prev_close = fetch_yf_last_two(code)
-        except Exception:
-            print(f"⚠️ 無法取得 {code} 價格資料")
-            continue
-
-    # --- 均線 ---
-    ma10, ma20, prev_ma20 = calc_ma10_ma20(code)
-
-    # --- 漲跌幅文字 ---
-    chg_txt = ""
-    if price is not None and prev_close is not None:
-        chg_pct = (price - prev_close) / prev_close * 100
-        symbol = "🔺" if chg_pct > 0 else ("🔻" if chg_pct < 0 else "⏺")
-        chg_txt = f"{symbol}{chg_pct:.2f}%"
-
-    # --- 事件判定（沿用你現有的觸碰/上穿/下穿）---
-    event = None
-# 只做 MA20 的「昨日→今日」穿越判定（兩種方向）
-    if (prev_close is not None and prev_ma20 is not None
-    and price is not None and ma20 is not None):
-        if prev_close < prev_ma20 and price > ma20:
-            event = "crossup20"     # 昨日低於、今日高於
-        elif prev_close > prev_ma20 and price < ma20:
-            event = "crossdown20"   # 昨日高於、今日低於
-
-
-    # --- 警報訊息（不做跨執行去重；有需要再說）---
-    if event:
-        if event == "crossup20":
-            alerts.append(f"⬆️ {name}（{code}）突破 MA20｜今價 {fmt2(price)}｜MA20 {fmt2(ma20)}")
-        elif event == "crossdown20":
-            alerts.append(f"⬇️ {name}（{code}）突破 MA20｜今價 {fmt2(price)}｜MA20 {fmt2(ma20)}")
-        elif event == "touch10":
-            alerts.append(f"📍 {name}（{code}）接近 MA10｜今價 {fmt2(price)}｜MA10 {fmt2(ma10)}")
-
-    # --- 列表輸出（先用直排；之後再做對齊版）---
-    lines.append(
-    f"{code:<5} {name:<8}｜今價 {fmt2(price):>7}｜{chg_txt:<8}｜MA10 {fmt2(ma10):>7}｜MA20 {fmt2(ma20):>7}"
-)
-
-# ===== 推播輸出 =====
-summary = "📊 今日股價監控\n" + "\n".join(lines)
-sent_summary = line_send(summary)
-if not sent_summary:
-    print(summary)
-
-if alerts:
-    alert_msg = "📣 均線警報\n" + "\n".join(alerts)
-    sent_alerts = line_send(alert_msg)
-    if not sent_alerts:
-        print(alert_msg)
+        main()
+    except Exception as e:
+        print("[FATAL]", e)
+        sys.exit(1)
