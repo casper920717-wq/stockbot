@@ -29,7 +29,7 @@ import pandas as pd
 
 # 代碼清單：預設從環境變數 TW_CODES（逗號分隔，如 "2330,2603,8446"），
 # 若未設則用下方 DEFAULT_CODES。
-DEFAULT_CODES = ["2330", "2603", "8446", "0050"]
+DEFAULT_CODES = ["2330.TW", "2344", "2408", "2421", "3017", "3206", "3231", "3324", "3515", "3661", "6230", "6415"]
 TW_CODES = [c.strip() for c in os.getenv("TW_CODES", "").split(",") if c.strip()] or DEFAULT_CODES
 
 # 每批處理數量（避免一次抓太多被節流）
