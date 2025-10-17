@@ -81,7 +81,53 @@ def send_line_text(message: str) -> bool:
         print(f"[ERROR] LINE 推播錯誤: {e}")
         return False
 
+# ========= 新增在這裡 👇 =========
+def ma_cross_signal(
+    code: str,
+    prev_close: float,
+    now_price: float,
+    prev_ma10: float,
+    curr_ma10: float,
+    prev_ma20: float,
+    curr_ma20: float,
+) -> str | None:
+    """判斷 MA10 / MA20 跨日突破訊號。"""
+    if prev_close < prev_ma20 and now_price > curr_ma20:
+        return f"{code}｜買進，突破MA20"
+    if prev_close > prev_ma20 and now_price < curr_ma20:
+        return f"{code}｜賣出，跌落MA20"
+    if prev_close < prev_ma10 and now_price > curr_ma10:
+        return f"{code}｜買進，突破MA10"
+    if prev_close > prev_ma10 and now_price < curr_ma10:
+        return f"{code}｜賣出，跌落MA10"
+    return None
 
+def _consolidate_signals(code: str, signals: list[str]) -> list[str]:
+    """
+    把同方向（向上=買進 / 向下=賣出）的 MA10、MA20 合併成一條訊息。
+    例如：
+      ["向上突破 MA20，買進", "向上突破 MA10，買進"]
+      -> ["3206｜向上突破 MA10 MA20，買進"]
+    """
+    up_levels, down_levels = [], []
+
+    for s in signals:
+        lvl = "MA10" if "MA10" in s else ("MA20" if "MA20" in s else None)
+        if not lvl:
+            continue
+        if ("向上突破" in s) or ("突破" in s and "買進" in s):
+            up_levels.append(lvl)
+        elif ("向下" in s) or ("跌落" in s and "賣出" in s):
+            down_levels.append(lvl)
+
+    msgs = []
+    if up_levels:
+        lvls = sorted(up_levels, key=lambda x: int(x[2:]))  # MA10 → MA20
+        msgs.append(f"{code}｜向上突破 {' '.join(lvls)}，買進")
+    if down_levels:
+        lvls = sorted(down_levels, key=lambda x: int(x[2:]))
+        msgs.append(f"{code}｜向下跌落 {' '.join(lvls)}，賣出")
+    return msgs
 # ========= yfinance 工具 =========
 def _resolve_symbol(code: str) -> Optional[str]:
     """根據 code（可含 .TW/.TWO 或純數字）決定優先順序，先用日線快查確認是否有資料。"""
@@ -167,21 +213,6 @@ def analyze_symbol(symbol: str) -> Tuple[Optional[float], List[str]]:
     return pct_change, signals
 
 
-def _arrow(p: Optional[float]) -> str:
-    if p is None or math.isnan(p):
-        return "—"
-    if p > 0:
-        return "▲"
-    if p < 0:
-        return "▼"
-    return "—"
-
-
-def _fmt_pct(p: Optional[float]) -> str:
-    if p is None or math.isnan(p):
-        return "—"
-    return f"{abs(p):.2f}%"  # 百分比顯示絕對值，方向用箭頭表達
-
 
 # ========= 主流程 =========
 def main():
@@ -205,34 +236,12 @@ def main():
             arrow = _arrow(pct_change)
             pct_s = _fmt_pct(pct_change)
             if signals:
-                # 同一行：代碼 + 漲跌幅 + 訊號
-                lines.append(f"{base} {arrow}{pct_s}（{ '；'.join(signals) }）")
-            else:
-                lines.append(f"{base} {arrow}{pct_s}")
+                msgs = _consolidate_signals(base, signals)
+                for msg in msgs:
+                    print(msg)
+                    send_line_text(msg)
+                    time.sleep(1.0)
 
-            time.sleep(0.2)  # 降低 Yahoo 節流
-        time.sleep(0.5)
-
-    # 整理並推播（每則限制長度，簡單切段）
-    if lines:
-        header = f"【台股盤中】{now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-        buf = header
-        chunks: List[str] = []
-        for line in lines:
-            if len(buf) + 1 + len(line) > 900:
-                chunks.append(buf)
-                buf = header + "\n" + line
-            else:
-                buf += "\n" + line
-        if buf:
-            chunks.append(buf)
-
-        for part in chunks:
-            print(part)
-            send_line_text(part)
-            time.sleep(1.0)
-    else:
-        print("[INFO] 本次沒有可顯示的個股資訊。")
 
 
 if __name__ == "__main__":
