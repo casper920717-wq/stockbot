@@ -233,8 +233,6 @@ def main():
 
             pct_change, signals = analyze_symbol(sym)
             base = sym.split(".")[0]
-            arrow = _arrow(pct_change)
-            pct_s = _fmt_pct(pct_change)
             if signals:
                 msgs = _consolidate_signals(base, signals)
                 for msg in msgs:
