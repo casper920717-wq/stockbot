@@ -14,6 +14,17 @@ tw_stockbot_push.py — 台股 MA10/MA20 突破 + 漲跌幅推播（yfinance-onl
 - LINE Messaging API（支援 LINE_CHANNEL_ACCESS_TOKEN/LINE_CHANNEL_TOKEN、LINE_TO/LINE_USER_ID）
 """
 
+from datetime import datetime
+import pytz
+
+TZ_TAIPEI = pytz.timezone("Asia/Taipei")
+
+# ===== 先做週末檢查（以台北時間為準） =====
+now_tw = datetime.now(TZ_TAIPEI)
+if now_tw.weekday() >= 5:  # 週六(5)、週日(6)
+    print(f"[INFO] 台北時間 {now_tw.strftime('%Y-%m-%d %H:%M:%S %Z')} 為週末，不執行。")
+    exit(0)
+# ===== 週一～週五才會繼續往下執行 =====
 import os
 import sys
 import time
