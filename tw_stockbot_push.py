@@ -1,42 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tw_stockbot_push.py — 台股 MA10/MA20 突破 + 漲跌幅推播（yfinance-only, LINE Messaging API）
+tw_stockbot_push.py — 台股 MA10/MA20 突破 + 狀態推播（yfinance + LINE）
 
-變更點
-- 每一檔都顯示「今日漲跌幅」（用 ▲/▼/— 表示方向 + 百分比），
-- 若該檔有出現 MA10/MA20 跨日突破，再在同一行加上提示（不顯示價格或均線數值）。
-
-其餘特性
-- 只用 yfinance 的「日線」資料
-- 自動 fallback：先 .TW → 再 .TWO（或相反）
-- 台灣時間 09:00–13:30 執行（可用 ALLOW_OUTSIDE_WINDOW=true 跳過）
-- LINE Messaging API（支援 LINE_CHANNEL_ACCESS_TOKEN/LINE_CHANNEL_TOKEN、LINE_TO/LINE_USER_ID）
+目前行為：
+- 週六、週日不執行
+- 平日預設只在台北時間 09:00–13:30 執行（可用 TIME_WINDOW_CHECK=false 關閉）
+- 每一檔股票一定會有一行文字
+  - 有突破：沿用「向上/向下突破 MA10/MA20，買進/賣出」的訊息
+  - 沒突破：顯示「股票代碼 目前 高於/低於 MA10/MA20」
+- 所有股票的結果會「合併成一條 LINE 訊息」推播
 """
 
-from datetime import datetime
-import pytz
-
-TZ_TAIPEI = pytz.timezone("Asia/Taipei")
-
-# ===== 先做週末檢查（以台北時間為準） =====
-now_tw = datetime.now(TZ_TAIPEI)
-if now_tw.weekday() >= 5:  # 週六(5)、週日(6)
-    print(f"[INFO] 台北時間 {now_tw.strftime('%Y-%m-%d %H:%M:%S %Z')} 為週末，不執行。")
-    exit(0)
-# ===== 週一～週五才會繼續往下執行 =====
 import os
 import sys
 import time
-import math
 import warnings
 from typing import Optional, Tuple, List
-from datetime import datetime, time as dtime
 
+from datetime import datetime
 import pytz
 import requests
 import yfinance as yf
 import pandas as pd
+
+# ========= 時區與週末判斷 =========
+TZ_TAIPEI = pytz.timezone("Asia/Taipei")
+
+# 先做週末檢查（以台北時間為準）
+_now_tw = datetime.now(TZ_TAIPEI)
+if _now_tw.weekday() >= 5:  # 週六(5)、週日(6)
+    print(f"[INFO] 台北時間 {_now_tw.strftime('%Y-%m-%d %H:%M:%S %Z')} 為週末，不執行。")
+    sys.exit(0)
 
 # ---- 降噪 ----
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -45,9 +40,9 @@ warnings.filterwarnings("ignore", message=".*Quote not found for symbol.*")
 
 # ========= 使用者設定 ======
 # 要追蹤的股票代碼（純數字即可，也可含 .TW / .TWO）
-WATCH_CODES = [ "2059","2330", "2344", "8299", "6412", "2454", "3443", "3661", "6515", "3711"]
-# 每次對 LINE 送出訊息之間的最短間隔（秒）
-LINE_PUSH_INTERVAL = 1.0
+WATCH_CODES = [
+    "2330", "2603", "2885", "2886", "0050",
+]
 
 # 是否只在台北時間 09:00–13:30 間執行
 # 若設為 "true" 以外，就算超出時間區間也會照跑
@@ -66,7 +61,7 @@ LINE_API_URL = "https://api.line.me/v2/bot/message/push"
 def send_line_text(msg: str) -> None:
     """送純文字訊息到 LINE（若沒設定 token / to，就只印出不送）。"""
     if not LINE_TOKEN or not LINE_TO:
-        print("[LINE 模擬]", msg)
+        print("[LINE 模擬]\n" + msg)
         return
 
     headers = {
@@ -145,7 +140,7 @@ def _moving_mean(s: pd.Series, n: int) -> Optional[float]:
 def analyze_symbol(symbol: str) -> Tuple[Optional[float], List[str], Optional[str]]:
     """
     回傳:
-    - 今日漲跌幅百分比 (float 或 None)
+    - 今日漲跌幅百分比 (float 或 None) 目前還沒用到，但保留
     - 訊號列表（突破訊號文字）
     - ma_status: 當日收盤相對 MA10/MA20 的位置描述字串，例如 "高於 MA10、低於 MA20"
     """
@@ -168,7 +163,7 @@ def analyze_symbol(symbol: str) -> Tuple[Optional[float], List[str], Optional[st
         ma20_t = _moving_mean(closes, 20)
 
         if None not in (ma10_y, ma10_t, ma20_y, ma20_t):
-            # ===== 突破判斷（沿用原本邏輯） =====
+            # ===== 突破判斷 =====
             # MA20
             if (y_close < ma20_y) and (today_close > ma20_t):
                 signals.append("向上突破 MA20，買進")
@@ -199,14 +194,15 @@ def analyze_symbol(symbol: str) -> Tuple[Optional[float], List[str], Optional[st
     return pct_change, signals, ma_status
 
 
-def _consolidate_signals(code: str, signals: list[str]) -> list[str]:
+def _consolidate_signals(code: str, signals: List[str]) -> List[str]:
     """
     把同方向（向上=買進 / 向下=賣出）的 MA10、MA20 合併成一條訊息。
     例如：
       ["向上突破 MA20，買進", "向上突破 MA10，買進"]
       -> ["3206｜向上突破 MA10 MA20，買進"]
     """
-    up_levels, down_levels = [], []
+    up_levels: List[str] = []
+    down_levels: List[str] = []
 
     for s in signals:
         lvl = "MA10" if "MA10" in s else ("MA20" if "MA20" in s else None)
@@ -217,7 +213,7 @@ def _consolidate_signals(code: str, signals: list[str]) -> list[str]:
         elif ("向下" in s) or ("跌落" in s and "賣出" in s):
             down_levels.append(lvl)
 
-    msgs = []
+    msgs: List[str] = []
     if up_levels:
         lvls = sorted(up_levels, key=lambda x: int(x[2:]))  # MA10 → MA20
         msgs.append(f"{code}｜向上突破 {' '.join(lvls)}，買進")
@@ -238,7 +234,7 @@ def main() -> None:
         return
 
     # 2) 解析每檔股票的實際 yfinance symbol
-    resolved = {}
+    resolved: dict[str, str] = {}
     for code in WATCH_CODES:
         sym = _resolve_symbol(code)
         if sym:
@@ -251,33 +247,40 @@ def main() -> None:
         print("[ERROR] 沒有任何可用的股票代碼。")
         return
 
-    # 3) 逐一分析
-    codes = list(resolved.keys())
-    BATCH_SIZE = 5  # 一次處理幾檔，避免對 LINE 壓力太大
+    # 3) 逐一分析，並把所有訊息合併成一條
+    all_msgs: List[str] = []
 
-    for i in range(0, len(codes), BATCH_SIZE):
-        batch = codes[i:i + BATCH_SIZE]
-        for code in batch:
-            sym = resolved[code]
-            pct_change, signals, ma_status = analyze_symbol(sym)
-            base = sym.split(".")[0]
+    # 為了固定順序，可以依照 WATCH_CODES 原順序走
+    for code in WATCH_CODES:
+        if code not in resolved:
+            continue
+        sym = resolved[code]
+        pct_change, signals, ma_status = analyze_symbol(sym)
+        base = sym.split(".")[0]  # 例如 "2330.TW" -> "2330"
 
-            if signals:
-                # 有突破：沿用原本格式（多檔 MA10/MA20 會被合併）
-                msgs = _consolidate_signals(base, signals)
-                for msg in msgs:
-                    print(msg)
-                    send_line_text(msg)
-                    time.sleep(1.0)
+        if signals:
+            # 有突破：沿用原本格式（多檔 MA10/MA20 會被合併）
+            msgs = _consolidate_signals(base, signals)
+            for m in msgs:
+                print(m)
+                all_msgs.append(m)
+        else:
+            # 沒有突破：一樣要通知目前在 MA10/MA20 的位置
+            if ma_status:
+                m = f"{base} 目前 {ma_status}"
             else:
-                # 沒有突破：一樣要通知目前在 MA10/MA20 的位置
-                if ma_status:
-                    msg = f"{base} 目前 {ma_status}"
-                else:
-                    msg = f"{base} 目前 無法計算 MA10/MA20"
-                print(msg)
-                send_line_text(msg)
-                time.sleep(1.0)
+                m = f"{base} 目前 無法計算 MA10/MA20"
+            print(m)
+            all_msgs.append(m)
+
+    if not all_msgs:
+        print("[INFO] 沒有任何訊息可發送。")
+        return
+
+    final_text = "\n".join(all_msgs)
+    print("\n[FINAL MESSAGE]\n" + final_text)
+    send_line_text(final_text)
+    # 若未來有需要，可在這裡加 time.sleep(1.0) 保險
 
 
 if __name__ == "__main__":
