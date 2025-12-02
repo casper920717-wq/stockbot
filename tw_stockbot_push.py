@@ -44,7 +44,7 @@ warnings.filterwarnings("ignore", message=".*possibly delisted.*")
 warnings.filterwarnings("ignore", message=".*Quote not found for symbol.*")
 
 # ========= 使用者設定 =========
-DEFAULT_CODES = ["2330", "2344", "2408", "2421", "3017", "3206", "3231", "3324", "3515", "3661", "6230", "6415"]
+DEFAULT_CODES = [ "2059","2330", "2344", "8299", "6412", "2454", "3443", "3661", "6515", "3711"]
 TW_CODES = [c.strip() for c in os.getenv("TW_CODES", "").split(",") if c.strip()] or DEFAULT_CODES
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
