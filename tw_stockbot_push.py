@@ -34,9 +34,7 @@ warnings.filterwarnings("ignore", message=".*possibly delisted.*")
 warnings.filterwarnings("ignore", message=".*Quote not found for symbol.*")
 
 # ========= 使用者設定 =========
-WATCH_CODES = [
-    "2330", "2603", "2885", "2886", "0050",
-]
+WATCH_CODES = [ "2059","2330", "2344", "8299", "6412", "2454", "3443", "3661", "6515", "3711"]
 
 TIME_WINDOW_CHECK = os.getenv("TIME_WINDOW_CHECK", "true").lower() == "true"
 
